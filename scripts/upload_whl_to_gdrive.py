@@ -23,12 +23,16 @@ Notes:
   - The script picks a wheel (.whl) file for the requested version or latest
     if --version is omitted. If multiple wheel files exist, a pure Python
     wheel will be preferred; otherwise the first wheel for the release is used.
+  - New options added: --wheel-filter (prefer filenames containing substring),
+    --filename-regex (regex to select filename, overrides --wheel-filter),
+    and --windows-amd64 (convenience flag to prefer 'win_amd64' wheels).
 """
 
 import argparse
 import io
 import sys
 import requests
+import re
 from typing import Optional, Tuple
 
 try:
@@ -46,16 +50,21 @@ PYPI_JSON_URL = "https://pypi.org/pypi/{package}/json"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
-def get_wheel_info(package: str, version: Optional[str] = None) -> Tuple[str, str]:
+def get_wheel_info(package: str, version: Optional[str] = None,
+                   wheel_substring: Optional[str] = None,
+                   filename_regex: Optional[str] = None) -> Tuple[str, str]:
     """Return (download_url, filename) for a wheel from PyPI.
 
     Args:
       package: package name on PyPI
       version: optional version string. If None, use latest.
+      wheel_substring: optional substring to prefer in the wheel filename (e.g. 'manylinux', 'win_amd64')
+      filename_regex: optional regex to match wheel filename exactly (overrides wheel_substring)
 
     Raises:
       RuntimeError if no wheel is found or package not found.
     """
+
     url = PYPI_JSON_URL.format(package=package)
     r = requests.get(url, timeout=15)
     if r.status_code == 404:
@@ -79,6 +88,22 @@ def get_wheel_info(package: str, version: Optional[str] = None) -> Tuple[str, st
     wheels = [f for f in files if f.get("filename", "").endswith('.whl')]
     if not wheels:
         raise RuntimeError("No wheel (.whl) files found for the requested release")
+
+    # If a filename regex is supplied, prefer matching files
+    if filename_regex:
+        try:
+            pattern = re.compile(filename_regex)
+            matched = [f for f in wheels if pattern.search(f.get("filename", ""))]
+            if matched:
+                wheels = matched
+        except re.error as e:
+            raise RuntimeError(f"Invalid filename regex: {e}")
+
+    # Otherwise, if a substring filter is supplied, prefer those filenames
+    if not filename_regex and wheel_substring:
+        matched = [f for f in wheels if wheel_substring in f.get("filename", "")]
+        if matched:
+            wheels = matched
 
     # Prefer pure Python wheels (no platform tag) or manylinux? Choose heuristics.
     def score_wheel(f):
@@ -147,12 +172,22 @@ def main(argv=None):
     p.add_argument('--service-account', '-s', required=True, help='Path to service account JSON key file')
     p.add_argument('--folder-id', '-f', help='Optional Drive folder ID to upload into')
     p.add_argument('--dry-run', action='store_true', help='Show which wheel would be downloaded but do not download/upload')
+    p.add_argument('--wheel-filter', help="Prefer wheel filenames containing this substring (e.g. 'manylinux2014', 'win_amd64')")
+    p.add_argument('--filename-regex', help='Regex to select the wheel filename (overrides --wheel-filter)')
+    p.add_argument('--windows-amd64', action='store_true', help="Convenience flag: prefer 'win_amd64' wheels")
 
     args = p.parse_args(argv)
 
     try:
         print(f"Looking up wheel for {args.package} {args.version or '(latest)'} on PyPI...")
-        url, filename = get_wheel_info(args.package, args.version)
+
+        # Determine wheel filter: --filename-regex takes precedence, then explicit --wheel-filter,
+        # then convenience --windows-amd64 flag.
+        wheel_filter = args.wheel_filter
+        if args.windows_amd64 and not wheel_filter:
+            wheel_filter = 'win_amd64'
+
+        url, filename = get_wheel_info(args.package, args.version, wheel_filter, args.filename_regex)
         print(f"Found wheel: {filename}\nURL: {url}")
 
         if args.dry_run:
